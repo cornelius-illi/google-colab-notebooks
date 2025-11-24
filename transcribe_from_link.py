@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import glob
+import time
 
 from dotenv import load_dotenv
 from jinja2 import Template
@@ -93,6 +94,26 @@ def download_audio(url: str, target_dir: str) -> str:
 
     logging.info("Saved audio to %s", filepath)
     return filepath
+
+
+def get_audio_duration_seconds(path: str):
+    """Return duration in seconds for an audio file, or None if not available."""
+    try:
+        from mutagen import File as MutagenFile
+    except Exception:
+        return None
+
+    try:
+        audio = MutagenFile(path)
+        if audio is None:
+            return None
+        # Different formats expose length in different ways
+        length = getattr(audio.info, 'length', None)
+        if length is None:
+            return None
+        return float(length)
+    except Exception:
+        return None
 
 
 def timestamp_to_seconds(ts_str):
@@ -189,10 +210,14 @@ def main():
     parser.add_argument("--speakers", help="Comma-separated speaker names (optional)", default="")
     parser.add_argument("--output", help="Output transcript file", default="transcript.txt")
     parser.add_argument("--dry-run", help="Only download (or validate) the file and exit", action="store_true")
+    parser.add_argument("--model", help="Model name to use for generate_content (CLI overrides GEMINI_MODEL env)", default=None)
+    parser.add_argument("--list-models", help="List available models for your API key and exit", action="store_true")
     args = parser.parse_args()
 
     load_dotenv()
     api_key = os.getenv("GOOGLE_API_KEY")
+    # Read GEMINI_MODEL from env; CLI --model will override it if provided
+    env_model = os.getenv("GEMINI_MODEL")
     # API key optional if user only wants a dry-run or is passing a local file
     if not api_key:
         logging.warning("GOOGLE_API_KEY not set. API calls will be skipped unless you provide --dry-run.")
@@ -207,6 +232,27 @@ def main():
             logging.error("Failed to import or construct google-genai client: %s", e)
             client = None
 
+    # Decide which model name to use: CLI > env > fallback
+    chosen_model = args.model or env_model or "models/gemini-2.5-pro"
+    args.model = chosen_model
+    logging.info("Using model: %s", args.model)
+
+    # If user requested listing models, do that now and exit
+    if args.list_models:
+        if not client:
+            logging.error("No GenAI client available. Set GOOGLE_API_KEY and ensure google-genai is installed.")
+            sys.exit(1)
+        try:
+            logging.info("Listing models available to this API key:")
+            models = client.models.list()
+            for m in models:
+                name = getattr(m, 'name', None) or getattr(m, 'model', None) or str(m)
+                logging.info(" - %s", name)
+        except Exception as e:
+            logging.error("Failed to list models: %s", e)
+            sys.exit(1)
+        return
+
     speakers = [s.strip() for s in args.speakers.split(",") if s.strip()]
     if not speakers:
         speakers = ["Host", "Guest"]
@@ -215,12 +261,19 @@ def main():
 
     # Determine if input is URL or local file
     is_url = args.input.lower().startswith("http")
+    # Track total runtime
+    job_start = time.time()
+
+    audio_duration = None
 
     if args.dry_run:
         # For dry-run: validate or download file and exit
         if is_url:
             with tempfile.TemporaryDirectory() as tmpdir:
                 audio_path = download_audio(args.input, tmpdir)
+                audio_duration = get_audio_duration_seconds(audio_path)
+                if audio_duration is not None:
+                    logging.info("Audio duration: %s seconds", int(audio_duration))
                 logging.info("Dry-run: downloaded to %s", audio_path)
         else:
             if os.path.exists(args.input):
@@ -235,6 +288,7 @@ def main():
     if is_url:
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = download_audio(args.input, tmpdir)
+            audio_duration = get_audio_duration_seconds(audio_path)
             uploaded_file = None
             if client:
                 logging.info("Uploading audio to Files API...")
@@ -242,12 +296,75 @@ def main():
             else:
                 logging.error("No GenAI client available. Set GOOGLE_API_KEY to enable transcription.")
                 sys.exit(1)
-
             logging.info("Requesting transcription from Gemini model...")
-            response = client.models.generate_content(
-                model="gemini-2.5-pro-exp-03-25",
-                contents=[prompt, uploaded_file],
-            )
+            # Provide progress logging for long-running calls
+            import threading
+
+            stop_event = threading.Event()
+
+            def _progress_logger():
+                start = time.time()
+                while not stop_event.wait(5.0):
+                    elapsed = int(time.time() - start)
+                    logging.info("Waiting for model response... %ds elapsed", elapsed)
+
+            prog_thread = threading.Thread(target=_progress_logger, daemon=True)
+            prog_thread.start()
+
+            try:
+                # Prefer streaming API if available
+                stream_fn = getattr(client.models, 'generate_content_stream', None)
+                if callable(stream_fn):
+                    raw_chunks = []
+                    try:
+                        for chunk in stream_fn(model=args.model, contents=[prompt, uploaded_file]):
+                            # Attempt to extract text from chunk
+                            text_piece = getattr(chunk, 'text', None) or getattr(chunk, 'content', None) or str(chunk)
+                            raw_chunks.append(text_piece)
+                            logging.info("Received chunk, total length=%d", sum(len(c) for c in raw_chunks))
+                        raw_text = "".join(raw_chunks)
+                        response = type('R', (), {'text': raw_text})()
+                    except Exception:
+                        # If streaming fails, fall back to blocking call below
+                        response = client.models.generate_content(model=args.model, contents=[prompt, uploaded_file])
+                else:
+                    response = client.models.generate_content(model=args.model, contents=[prompt, uploaded_file])
+            except Exception as e:
+                # Try to provide a helpful error when model is not found
+                try:
+                    # _genai may be available as the module used to create client
+                    import google.genai as _genai_mod
+                    ClientError = _genai_mod.errors.ClientError
+                except Exception:
+                    ClientError = None
+
+                # Decide if this looks like a model-not-found error
+                is_model_not_found = False
+                if ClientError is not None and isinstance(e, ClientError):
+                    is_model_not_found = True
+                else:
+                    msg = str(e).lower()
+                    if "not found" in msg or "not_found" in msg or "404" in msg:
+                        is_model_not_found = True
+
+                if is_model_not_found:
+                    logging.error("Model not found. Attempting to list available models to help you choose a valid one:")
+                    try:
+                        models = client.models.list()
+                        # `models` may be an iterator or object; try to iterate sensibly
+                        for m in models:
+                            name = getattr(m, 'name', None) or getattr(m, 'model', None) or str(m)
+                            logging.info(" - %s", name)
+                    except Exception:
+                        logging.error("Failed to list models; check your API key, permissions and network connectivity.")
+                    logging.error("Update the `model` parameter to a supported model name (see list above).")
+                    sys.exit(1)
+
+                # Re-raise if not handled
+                raise
+            finally:
+                stop_event.set()
+                prog_thread.join(timeout=1.0)
 
     else:
         # local file
@@ -255,6 +372,7 @@ def main():
         if not os.path.exists(audio_path):
             logging.error("Local file not found: %s", audio_path)
             sys.exit(1)
+        audio_duration = get_audio_duration_seconds(audio_path)
         if not client:
             logging.error("No GenAI client available. Set GOOGLE_API_KEY to enable transcription.")
             sys.exit(1)
@@ -262,7 +380,7 @@ def main():
         uploaded_file = client.files.upload(file=audio_path)
         logging.info("Requesting transcription from Gemini model...")
         response = client.models.generate_content(
-            model="gemini-2.5-pro-exp-03-25",
+            model=args.model,
             contents=[prompt, uploaded_file],
         )
 
@@ -274,7 +392,54 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(processed)
 
+    # Stats: duration, tokens, cost estimate
+    job_end = time.time()
+    elapsed = job_end - job_start
+
     logging.info("Transcript written to %s", args.output)
+
+    # Audio duration already logged earlier if available
+    if audio_duration is not None:
+        hrs, rem = divmod(int(audio_duration), 3600)
+        mins, secs = divmod(rem, 60)
+        logging.info("Audio duration: %02d:%02d:%02d", hrs, mins, secs)
+
+    # Token counting (if supported)
+    tokens_prompt = None
+    tokens_output = None
+    total_tokens = None
+    est_cost = None
+    try:
+        # client.models.count_tokens may exist, or compute_tokens
+        count_fn = getattr(client.models, 'count_tokens', None) or getattr(client.models, 'compute_tokens', None) or None
+        if callable(count_fn):
+            try:
+                tokens_prompt = int(count_fn(prompt))
+            except Exception:
+                tokens_prompt = None
+            try:
+                tokens_output = int(count_fn(raw_text))
+            except Exception:
+                tokens_output = None
+        # Fallback: estimate tokens by splitting on whitespace (very rough)
+        if tokens_prompt is None:
+            tokens_prompt = max(1, len(prompt.split()))
+        if tokens_output is None:
+            tokens_output = max(1, len(raw_text.split()))
+
+        total_tokens = tokens_prompt + tokens_output
+
+        # Cost estimate: use env var TOKEN_COST_PER_1K (USD per 1000 tokens) or default 0.002 USD/1k
+        rate = float(os.getenv('TOKEN_COST_PER_1K', '0.002'))
+        est_cost = (total_tokens / 1000.0) * rate
+    except Exception:
+        tokens_prompt = tokens_prompt or None
+        tokens_output = tokens_output or None
+
+    logging.info("Job elapsed time: %ds", int(elapsed))
+    if total_tokens is not None:
+        logging.info("Tokens - prompt: %s, output: %s, total: %s", tokens_prompt, tokens_output, total_tokens)
+        logging.info("Estimated cost (at $%s per 1k tokens): $%.6f", rate, est_cost)
 
 
 if __name__ == "__main__":
