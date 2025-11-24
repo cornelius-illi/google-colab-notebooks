@@ -49,3 +49,6 @@ Captions should be short (one or two short sentences) and cover at most 20 secon
 ```
 
 If you want, I can integrate an option to request JSON-aligned timestamps as well.
+
+## Source:
+https://colab.research.google.com/drive/12VdQuGWGCS7oiH7v9VZoulhj29flZuY-?usp=sharing

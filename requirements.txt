@@ -2,3 +2,4 @@ google-genai
 jinja2
 python-dotenv
 yt-dlp
+pytest

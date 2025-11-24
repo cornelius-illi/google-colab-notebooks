@@ -24,10 +24,9 @@ import glob
 from dotenv import load_dotenv
 from jinja2 import Template
 
-import yt_dlp
-
 try:
-    from google import genai
+    # Defer heavy/optional imports to functions so unit tests can import this module
+    genai = None
 except Exception:
     genai = None
 
@@ -58,18 +57,23 @@ Produce the transcript as plain text with one caption per line.
 
 def download_audio(url: str, target_dir: str) -> str:
     """Download audio from URL into target_dir and return local filepath."""
+    import yt_dlp
+
+    # For direct mp3 links we can skip ffmpeg postprocessing (avoids requiring system ffmpeg)
+    needs_conversion = not url.lower().split('?')[0].endswith('.mp3')
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(target_dir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        # Use ffmpeg to convert to mp3 for consistent upload
-        "postprocessors": [{
+    }
+    if needs_conversion:
+        # Use ffmpeg to convert to mp3 for consistent upload when needed
+        ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
-        }],
-    }
+        }]
 
     logging.info("Downloading audio from %s", url)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -181,22 +185,27 @@ def process_transcript(input_text, max_segment_duration=30):
 
 def main():
     parser = argparse.ArgumentParser(description="Download audio from a link and transcribe using Google Gemini.")
-    parser.add_argument("url", help="URL to download audio from (e.g., YouTube link)")
+    parser.add_argument("input", help="URL or local path to audio file (URL if starts with http)")
     parser.add_argument("--speakers", help="Comma-separated speaker names (optional)", default="")
     parser.add_argument("--output", help="Output transcript file", default="transcript.txt")
+    parser.add_argument("--dry-run", help="Only download (or validate) the file and exit", action="store_true")
     args = parser.parse_args()
 
     load_dotenv()
     api_key = os.getenv("GOOGLE_API_KEY")
+    # API key optional if user only wants a dry-run or is passing a local file
     if not api_key:
-        logging.error("GOOGLE_API_KEY not set. Create a .env file or set environment variable.")
-        sys.exit(1)
+        logging.warning("GOOGLE_API_KEY not set. API calls will be skipped unless you provide --dry-run.")
 
-    if genai is None:
-        logging.error("google-genai library not found. Install requirements and try again.")
-        sys.exit(1)
-
-    client = genai.Client(api_key=api_key)
+    # Lazy import of google-genai to avoid hard dependency during tests
+    client = None
+    if api_key and not args.dry_run:
+        try:
+            from google import genai as _genai
+            client = _genai.Client(api_key=api_key)
+        except Exception as e:
+            logging.error("Failed to import or construct google-genai client: %s", e)
+            client = None
 
     speakers = [s.strip() for s in args.speakers.split(",") if s.strip()]
     if not speakers:
@@ -204,27 +213,68 @@ def main():
 
     prompt = PROMPT_TEMPLATE.render(speakers=speakers)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = download_audio(args.url, tmpdir)
+    # Determine if input is URL or local file
+    is_url = args.input.lower().startswith("http")
 
-        logging.info("Uploading audio to Files API...")
+    if args.dry_run:
+        # For dry-run: validate or download file and exit
+        if is_url:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                audio_path = download_audio(args.input, tmpdir)
+                logging.info("Dry-run: downloaded to %s", audio_path)
+        else:
+            if os.path.exists(args.input):
+                logging.info("Dry-run: local file exists: %s", args.input)
+            else:
+                logging.error("Dry-run: local file not found: %s", args.input)
+                sys.exit(1)
+        logging.info("Dry-run complete. Exiting.")
+        return
+
+    # Normal flow: either use local file or download first
+    if is_url:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = download_audio(args.input, tmpdir)
+            uploaded_file = None
+            if client:
+                logging.info("Uploading audio to Files API...")
+                uploaded_file = client.files.upload(file=audio_path)
+            else:
+                logging.error("No GenAI client available. Set GOOGLE_API_KEY to enable transcription.")
+                sys.exit(1)
+
+            logging.info("Requesting transcription from Gemini model...")
+            response = client.models.generate_content(
+                model="gemini-2.5-pro-exp-03-25",
+                contents=[prompt, uploaded_file],
+            )
+
+    else:
+        # local file
+        audio_path = args.input
+        if not os.path.exists(audio_path):
+            logging.error("Local file not found: %s", audio_path)
+            sys.exit(1)
+        if not client:
+            logging.error("No GenAI client available. Set GOOGLE_API_KEY to enable transcription.")
+            sys.exit(1)
+        logging.info("Uploading local audio to Files API...")
         uploaded_file = client.files.upload(file=audio_path)
-
         logging.info("Requesting transcription from Gemini model...")
         response = client.models.generate_content(
             model="gemini-2.5-pro-exp-03-25",
             contents=[prompt, uploaded_file],
         )
 
-        raw_text = getattr(response, "text", str(response))
-        logging.info("Raw model output length: %d", len(raw_text))
+    raw_text = getattr(response, "text", str(response))
+    logging.info("Raw model output length: %d", len(raw_text))
 
-        processed = process_transcript(raw_text, max_segment_duration=30)
+    processed = process_transcript(raw_text, max_segment_duration=30)
 
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(processed)
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(processed)
 
-        logging.info("Transcript written to %s", args.output)
+    logging.info("Transcript written to %s", args.output)
 
 
 if __name__ == "__main__":
