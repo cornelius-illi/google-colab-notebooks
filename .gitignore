@@ -1,6 +1,8 @@
 .env
 .venv
-.pytest_cache/
+.pytest_cache
 .DS_Store
+.vscode
 **/__pycache__
 data
+gemini_podcast_transcription.egg-info

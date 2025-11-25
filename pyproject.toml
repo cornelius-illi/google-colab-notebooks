@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemini-podcast-transcription"
+version = "0.0.0"
+description = "Transcribe audio from links using Gemini"
+readme = "README.md"
+requires-python = ">=3.8"
